@@ -13,6 +13,12 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 
+CHANGE_KINDS = {"added", "modified", "deleted", "renamed"}
+INVENTORY_SCHEMA = "govern-project-docs.inventory.v1"
+IMPACT_RECEIPT_SCHEMA = "govern-project-docs.receipt.v1"
+FREEZE_RECEIPT_SCHEMA = "govern-project-docs.freeze-receipt.v1"
+
+
 def load_json(path: Path) -> dict:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -240,6 +246,80 @@ def validate_adapter(adapter: dict) -> dict:
         "human_approval_required": [],
         "recovery": "Adapter validation completed from declared pointers and rules.",
     }
+
+
+def validate_inventory(
+    inventory: object,
+    *,
+    require_entries: bool = False,
+) -> list[dict]:
+    findings: list[dict] = []
+    if not isinstance(inventory, dict):
+        return [{"code": "malformed-inventory", "field": "root"}]
+    if inventory.get("schema") != INVENTORY_SCHEMA:
+        findings.append({"code": "unsupported-inventory-schema", "schema": inventory.get("schema")})
+    source = inventory.get("source")
+    if not isinstance(source, dict) or not isinstance(source.get("kind"), str) or not isinstance(source.get("verified"), bool):
+        findings.append({"code": "malformed-inventory", "field": "source"})
+    entries = inventory.get("entries")
+    if not isinstance(entries, list):
+        return findings + [{"code": "malformed-inventory", "field": "entries"}]
+    if require_entries and not entries:
+        findings.append({"code": "empty-inventory"})
+    seen: set[str] = set()
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            findings.append({"code": "malformed-inventory-entry", "entry": index})
+            continue
+        path, path_finding = normalize_path_value(str(entry.get("path", "")), "inventory.path")
+        if path_finding:
+            findings.append({"code": "malformed-inventory-entry", "entry": index, "field": "path"})
+            continue
+        if path in seen:
+            findings.append({"code": "duplicate-inventory-path", "path": path})
+        seen.add(path)
+        kind = entry.get("kind")
+        if kind is not None and kind not in CHANGE_KINDS:
+            findings.append({"code": "unknown-change-kind", "entry": index, "kind": kind})
+        if not isinstance(entry.get("existence"), bool):
+            findings.append({"code": "malformed-inventory-entry", "entry": index, "field": "existence"})
+        if "digest" not in entry:
+            findings.append({"code": "malformed-inventory-entry", "entry": index, "field": "digest"})
+        if kind == "renamed":
+            if not all(isinstance(entry.get(key), str) and entry.get(key) for key in ("old_path", "new_path")):
+                findings.append({"code": "malformed-inventory-entry", "entry": index, "field": "rename"})
+    return findings
+
+
+def validate_impact_receipt(receipt: object, adapter: dict, workspace: Path) -> list[dict]:
+    if not isinstance(receipt, dict):
+        return [{"code": "malformed-impact-receipt", "field": "root"}]
+    required_objects = ["adapter", "workspace", "inventory_source", "baseline_inventory", "verification_capability"]
+    required_lists = ["planned_paths", "affected_authorities", "candidate_authority_paths", "protected_paths", "excluded_paths", "human_approval_required"]
+    findings: list[dict] = []
+    if receipt.get("schema") != IMPACT_RECEIPT_SCHEMA:
+        findings.append({"code": "malformed-impact-receipt", "field": "schema"})
+    for field in required_objects:
+        if not isinstance(receipt.get(field), dict):
+            findings.append({"code": "malformed-impact-receipt", "field": field})
+    for field in required_lists:
+        if not is_string_list(receipt.get(field)):
+            findings.append({"code": "malformed-impact-receipt", "field": field})
+    if findings:
+        return findings
+    identity_mismatch = (
+        receipt["adapter"].get("project") != adapter.get("project")
+        or receipt["adapter"].get("schema_version") != adapter.get("schema_version")
+        or receipt["workspace"].get("path") != str(workspace.resolve())
+    )
+    if identity_mismatch:
+        findings.append({
+            "code": "impact-receipt-identity-mismatch",
+            "expected_project": adapter.get("project"),
+            "expected_workspace": str(workspace.resolve()),
+        })
+    findings.extend(validate_inventory(receipt["baseline_inventory"]))
+    return findings
 
 
 def validate_adapter_command(args: argparse.Namespace) -> None:
@@ -727,11 +807,18 @@ def impact_command(args: argparse.Namespace) -> None:
                 "baseline_inventory": source in {"git", "filesystem"},
                 "event_isolation": source in {"git", "filesystem"},
             },
+            "derived_evidence": True,
+            "generated": True,
+            "project_authority": False,
             "recovery": "Pass this receipt to Closeout with --receipt, plus actual changed paths and event-authorized documents.",
         }
 
+    impact_unverified = ["empty-impact-scope"] if not changed_paths else []
     emit({
-        "result": "fail" if path_findings or receipt_findings else "unproven" if human or protected or excluded else "pass",
+        "result": "fail" if path_findings or receipt_findings else "unproven" if impact_unverified or human or protected or excluded else "pass",
+        "coverage": {
+            "unverified": impact_unverified,
+        },
         "impact": {
             "changed_paths": changed_paths,
             "affected_authorities": affected,
@@ -754,6 +841,138 @@ def file_digest(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def snapshot_declared_paths(workspace: Path, paths: list[str]) -> tuple[list[dict], list[dict]]:
+    workspace = workspace.resolve()
+    findings: list[dict] = []
+    snapshots: list[dict] = []
+    seen: set[str] = set()
+    for raw_path in paths:
+        relative, finding = normalize_path_value(raw_path, "changed_path")
+        if finding:
+            findings.append(finding)
+            continue
+        if relative in seen:
+            findings.append({"code": "duplicate-freeze-path", "path": relative})
+            continue
+        seen.add(relative)
+        target = (workspace / relative).resolve()
+        try:
+            target.relative_to(workspace)
+        except ValueError:
+            findings.append({"code": "freeze-path-outside-workspace", "path": relative})
+            continue
+        if target.exists() and not target.is_file():
+            findings.append({"code": "freeze-path-not-file", "path": relative})
+            continue
+        exists = target.is_file()
+        snapshots.append({
+            "path": relative,
+            "existence": exists,
+            "digest": file_digest(target) if exists else None,
+        })
+    return sorted(snapshots, key=lambda item: item["path"]), findings
+
+
+def resolve_receipt_output_path(
+    output_path: str,
+    workspace: Path,
+    adapter: dict,
+) -> tuple[Path | None, list[dict]]:
+    workspace = workspace.resolve()
+    destination = Path(output_path)
+    if not destination.is_absolute():
+        destination = workspace / destination
+    destination = destination.resolve()
+    try:
+        relative = destination.relative_to(workspace).as_posix()
+    except ValueError:
+        return destination, []
+    excluded_patterns = safe_section(adapter, "boundaries").get("excluded", [])
+    if any(path_matches(relative, pattern) for pattern in excluded_patterns):
+        return destination, []
+    return None, [{
+        "code": "unsafe-receipt-output-path",
+        "path": str(destination),
+        "message": "receipt output must be outside the workspace or under an excluded boundary",
+    }]
+
+
+def write_receipt_file(
+    receipt: dict,
+    output_path: str | None,
+    workspace: Path,
+    adapter: dict,
+) -> tuple[str | None, list[dict]]:
+    if not output_path:
+        return None, []
+    destination, findings = resolve_receipt_output_path(output_path, workspace, adapter)
+    if findings or destination is None:
+        return None, findings
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return str(destination), []
+
+
+def freeze_command(args: argparse.Namespace) -> None:
+    adapter, missing = load_json_or_missing(Path(args.adapter))
+    if missing:
+        missing["freeze_receipt"] = None
+        emit(missing)
+        return
+    adapter_result = validate_adapter(adapter)
+    if adapter_result["result"] == "fail":
+        emit({
+            "result": "fail",
+            "freeze_receipt": None,
+            "mechanical_findings": adapter_result["mechanical_findings"],
+            "semantic_findings": [],
+            "human_approval_required": [],
+            "recovery": "Freeze cannot run until the project adapter validates.",
+        })
+        return
+
+    workspace = Path(args.workspace).resolve()
+    snapshots, findings = snapshot_declared_paths(workspace, args.changed_path)
+    if not args.changed_path:
+        findings.append({"code": "empty-freeze-scope"})
+    receipt = {
+        "schema": FREEZE_RECEIPT_SCHEMA,
+        "kind": "final-content-freeze",
+        "adapter": {
+            "project": adapter.get("project"),
+            "schema_version": adapter.get("schema_version"),
+        },
+        "workspace": {"path": str(workspace)},
+        "paths": snapshots,
+        "derived_evidence": True,
+        "generated": True,
+        "project_authority": False,
+        "capability": {
+            "proves": ["existence and SHA-256 fingerprints for declared paths at freeze time"],
+            "does_not_prove": ["that project validation ran", "which actor changed a path"],
+        },
+        "recovery": "Run project-selected final validation, then pass this receipt to live Closeout with --freeze-receipt.",
+    }
+    output_path = None
+    if not findings:
+        output_path, write_findings = write_receipt_file(
+            receipt,
+            args.write_receipt,
+            workspace,
+            adapter,
+        )
+        findings.extend(write_findings)
+    emit({
+        "result": "fail" if findings else "pass",
+        "freeze_receipt": receipt,
+        "receipt_output": output_path,
+        "mechanical_findings": findings,
+        "semantic_findings": [],
+        "human_approval_required": [],
+        "recovery": "Fix mechanical findings before validation." if findings else receipt["recovery"],
+    })
 
 
 def inventory_entry_paths(entry: dict) -> list[str]:
@@ -892,9 +1111,8 @@ def load_inventory_file(path: str | None) -> tuple[dict | None, list[dict]]:
         inventory = load_json(Path(path))
     except FileNotFoundError:
         return None, [{"code": "inventory-file-missing", "path": path}]
-    if not isinstance(inventory.get("entries"), list):
-        return None, [{"code": "invalid-inventory", "path": path, "message": "entries must be a list"}]
-    return inventory, []
+    findings = validate_inventory(inventory)
+    return (None, findings) if findings else (inventory, [])
 
 
 def make_actual_inventory(paths: list[str], source_kind: str) -> tuple[dict, list[dict]]:
@@ -936,7 +1154,7 @@ def git_status_inventory(workspace: Path) -> tuple[dict, list[dict]]:
         }, [{"code": "git-change-source-unavailable", "message": str(exc)}]
 
     completed = subprocess.run(
-        ["git", "status", "--porcelain=v1", "-z"],
+        ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
         cwd=workspace,
         check=True,
         stdout=subprocess.PIPE,
@@ -1120,6 +1338,22 @@ def resolve_change_inventory(
                 pass
         except FileNotFoundError:
             findings.append({"code": "receipt-missing", "path": receipt_path})
+        except SystemExit:
+            findings.append({"code": "malformed-impact-receipt", "path": receipt_path, "field": "json"})
+
+    if receipt is not None:
+        receipt_findings = validate_impact_receipt(receipt, adapter, workspace)
+        findings.extend(receipt_findings)
+        if receipt_findings:
+            receipt = None
+
+    freeze_receipt_path = getattr(args, "freeze_receipt", None) if args else None
+    if freeze_receipt_path:
+        try:
+            freeze_file = Path(freeze_receipt_path)
+            extra_excluded.append(str(freeze_file.resolve().relative_to(workspace.resolve())))
+        except ValueError:
+            pass
 
     baseline_inventory = None
     final_inventory = None
@@ -1140,11 +1374,11 @@ def resolve_change_inventory(
             final_inventory = loaded
 
     if baseline_inventory and not final_inventory:
-        if change_source == "filesystem":
+        if change_source in {"filesystem", "git"}:
             final_inventory, scan_findings = scan_filesystem_inventory(
                 workspace,
                 adapter,
-                source_kind="filesystem",
+                source_kind=f"{change_source}-final",
                 extra_excluded=extra_excluded,
             )
             findings.extend(scan_findings)
@@ -1166,7 +1400,15 @@ def resolve_change_inventory(
     if change_source in {"git", "auto"}:
         inventory, git_findings = git_status_inventory(workspace)
         if not git_findings:
-            entries = inventory.get("entries", [])
+            entries = [
+                entry
+                for entry in inventory.get("entries", [])
+                if not any(
+                    path_matches(path, excluded_receipt)
+                    for path in inventory_entry_paths(entry)
+                    for excluded_receipt in extra_excluded
+                )
+            ]
             return entries, [], receipt, findings, False, "git", inventory.get("source", {}).get("metadata", {})
         if change_source == "git":
             findings.extend(git_findings)
@@ -1232,26 +1474,99 @@ def path_scope_tokens(path: str) -> set[str]:
 
 
 def text_records_human_approval(text: str, approval_type: str, targets: list[str]) -> bool:
-    words = text_words(text)
-    if not {"human", "approval"}.issubset(words) and "approved" not in words:
+    fields: dict[str, str] = {}
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        fields[key.strip().lower()] = value.strip()
+    required = {"approval type", "object", "scope", "does not approve"}
+    if not required.issubset(fields) or any(not fields[key] for key in required):
         return False
-    type_tokens = {word for word in text_words(approval_type) if len(word) >= 4}
-    if type_tokens and not type_tokens.intersection(words):
+    recorded_type = fields["approval type"].rstrip(". ").casefold()
+    if recorded_type != approval_type.rstrip(". ").casefold():
         return False
+    object_scope = fields["object"]
     for target in targets:
-        target_tokens = path_scope_tokens(target)
-        if target not in text and target_tokens and not target_tokens.intersection(words):
+        if target not in object_scope and target not in text:
             return False
     return True
 
 
-def required_historical_approval_type(adapter: dict) -> str:
-    declared = adapter.get("human_approval", [])
-    if "irreversible archive handling" in declared:
-        return "irreversible archive handling"
-    if "historical material change" in declared:
-        return "historical material change"
-    return "historical material change"
+def generated_non_authority_evidence(text: str) -> bool:
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return bool(
+        isinstance(payload, dict)
+        and payload.get("derived_evidence") is True
+        and payload.get("generated") is True
+        and payload.get("project_authority") is False
+    )
+
+
+def rule_event_targets(rule: dict, event_paths: list[str]) -> list[str]:
+    rule_paths = rule.get("paths", []) if is_string_list(rule.get("paths")) else []
+    triggers = rule.get("triggers", []) if is_string_list(rule.get("triggers")) else []
+    return sorted({
+        path
+        for path in event_paths
+        if any(path_matches(path, pattern) or path_matches(pattern, path) for pattern in rule_paths)
+        or any(path_matches(path, trigger) for trigger in triggers)
+    })
+
+
+def affected_authority_rules(adapter: dict, event_paths: list[str]) -> list[dict]:
+    return [rule for rule in safe_rule_list(adapter) if rule_event_targets(rule, event_paths)]
+
+
+def rule_human_approval_types(adapter: dict, rule: dict) -> tuple[list[str], list[str]]:
+    precise = rule.get("human_approval_types")
+    if is_string_list(precise) and precise:
+        return sorted(set(precise)), []
+    if rule.get("human"):
+        declared = adapter.get("human_approval", [])
+        if is_string_list(declared) and len(set(declared)) == 1:
+            return list(dict.fromkeys(declared)), []
+        return [], [f"human-approval-type-unmapped:{rule.get('id', 'unknown')}"]
+    return [], []
+
+
+def required_human_approval_types(
+    adapter: dict,
+    event_paths: list[str],
+    historical_patterns: list[str] | None = None,
+) -> tuple[list[str], list[str]]:
+    required: set[str] = set()
+    uncertainty: set[str] = set()
+    affected = affected_authority_rules(adapter, event_paths)
+    for rule in affected:
+        types, rule_uncertainty = rule_human_approval_types(adapter, rule)
+        required.update(types)
+        uncertainty.update(rule_uncertainty)
+
+    for path in event_paths:
+        if not any(path_matches(path, pattern) for pattern in historical_patterns or []):
+            continue
+        matching = [rule for rule in affected if path in rule_event_targets(rule, [path])]
+        mapped = []
+        for rule in matching:
+            types, _ = rule_human_approval_types(adapter, rule)
+            mapped.extend(types)
+        if not mapped:
+            uncertainty.add(f"human-approval-type-unmapped:{path}")
+    return sorted(required), sorted(uncertainty)
+
+
+def approval_targets_by_type(adapter: dict, event_paths: list[str]) -> dict[str, list[str]]:
+    targets: dict[str, set[str]] = {}
+    for rule in affected_authority_rules(adapter, event_paths):
+        types, _ = rule_human_approval_types(adapter, rule)
+        rule_targets = rule_event_targets(rule, event_paths)
+        for approval_type in types:
+            targets.setdefault(approval_type, set()).update(rule_targets)
+    return {approval_type: sorted(paths) for approval_type, paths in targets.items()}
 
 
 SEMANTIC_ANSWER_KEYS = {
@@ -1307,7 +1622,16 @@ def evaluate_semantic_review(
         }, [{"code": "malformed-semantic-review", "path": review_path}], [], []
 
     answers = review.get("answers")
-    if not isinstance(answers, dict) or not SEMANTIC_ANSWER_KEYS.issubset(answers):
+    answers_complete = (
+        isinstance(answers, dict)
+        and SEMANTIC_ANSWER_KEYS.issubset(answers)
+        and all(
+            (isinstance(answers.get(key), str) and bool(answers.get(key).strip()))
+            or (isinstance(answers.get(key), list) and bool(answers.get(key)))
+            for key in SEMANTIC_ANSWER_KEYS
+        )
+    )
+    if not answers_complete:
         mechanical.append({"code": "malformed-semantic-review", "path": review_path, "field": "answers"})
     findings = review.get("findings")
     if not isinstance(findings, list):
@@ -1349,6 +1673,120 @@ def evaluate_semantic_review(
         "answers": answers if isinstance(answers, dict) else {},
         "findings": semantic_findings,
     }, mechanical, semantic_findings, sorted(set(unverified))
+
+
+def evaluate_freeze_receipt(
+    receipt_path: str | None,
+    *,
+    adapter: dict,
+    workspace: Path,
+    event_paths: list[str],
+) -> tuple[dict, list[dict], list[str]]:
+    if not receipt_path:
+        return {
+            "status": "not supplied",
+            "verified": False,
+            "source": None,
+            "paths": [],
+            "stale_paths": [],
+        }, [], ["final-content-freeze"]
+    try:
+        receipt = load_json(Path(receipt_path))
+    except FileNotFoundError:
+        return {
+            "status": "missing",
+            "verified": False,
+            "source": receipt_path,
+            "paths": [],
+            "stale_paths": [],
+        }, [{"code": "freeze-receipt-missing", "path": receipt_path}], []
+    except SystemExit:
+        return {
+            "status": "malformed",
+            "verified": False,
+            "source": receipt_path,
+            "paths": [],
+            "stale_paths": [],
+        }, [{"code": "malformed-freeze-receipt", "path": receipt_path, "field": "json"}], []
+
+    mechanical: list[dict] = []
+    if not isinstance(receipt, dict):
+        mechanical.append({"code": "malformed-freeze-receipt", "field": "root"})
+        receipt = {}
+    if receipt.get("schema") != FREEZE_RECEIPT_SCHEMA or receipt.get("kind") != "final-content-freeze":
+        mechanical.append({"code": "malformed-freeze-receipt", "field": "schema"})
+    if not isinstance(receipt.get("adapter"), dict) or not isinstance(receipt.get("workspace"), dict):
+        mechanical.append({"code": "malformed-freeze-receipt", "field": "identity"})
+    if not isinstance(receipt.get("paths"), list) or not receipt.get("paths"):
+        mechanical.append({"code": "malformed-freeze-receipt", "field": "paths"})
+    if not all(receipt.get(key) is expected for key, expected in {
+        "derived_evidence": True,
+        "generated": True,
+        "project_authority": False,
+    }.items()):
+        mechanical.append({"code": "malformed-freeze-receipt", "field": "authority-markers"})
+    if mechanical:
+        return {
+            "status": "malformed",
+            "verified": False,
+            "source": receipt_path,
+            "paths": [],
+            "stale_paths": [],
+        }, mechanical, []
+
+    identity_mismatch = (
+        receipt["adapter"].get("project") != adapter.get("project")
+        or receipt["adapter"].get("schema_version") != adapter.get("schema_version")
+        or receipt["workspace"].get("path") != str(workspace.resolve())
+    )
+    if identity_mismatch:
+        mechanical.append({
+            "code": "freeze-receipt-identity-mismatch",
+            "expected_project": adapter.get("project"),
+            "expected_workspace": str(workspace.resolve()),
+        })
+
+    frozen: dict[str, dict] = {}
+    for index, entry in enumerate(receipt["paths"]):
+        if not isinstance(entry, dict):
+            mechanical.append({"code": "malformed-freeze-receipt", "field": f"paths.{index}"})
+            continue
+        path, path_finding = normalize_path_value(str(entry.get("path", "")), "freeze.path")
+        if path_finding or not isinstance(entry.get("existence"), bool) or "digest" not in entry:
+            mechanical.append({"code": "malformed-freeze-receipt", "field": f"paths.{index}"})
+            continue
+        if path in frozen:
+            mechanical.append({"code": "duplicate-freeze-path", "path": path})
+            continue
+        frozen[path] = entry
+
+    missing_coverage = sorted(set(event_paths) - set(frozen))
+    if missing_coverage:
+        mechanical.append({"code": "freeze-receipt-missing-event-path", "paths": missing_coverage})
+
+    stale_paths: list[str] = []
+    for path, entry in frozen.items():
+        target = (workspace / path).resolve()
+        try:
+            target.relative_to(workspace.resolve())
+        except ValueError:
+            mechanical.append({"code": "freeze-path-outside-workspace", "path": path})
+            continue
+        current_exists = target.is_file()
+        current_digest = file_digest(target) if current_exists else None
+        if current_exists != entry.get("existence") or current_digest != entry.get("digest"):
+            stale_paths.append(path)
+    if stale_paths:
+        mechanical.append({"code": "final-content-changed-after-freeze", "paths": sorted(stale_paths)})
+
+    verified = not mechanical
+    return {
+        "status": "verified" if verified else "invalid",
+        "verified": verified,
+        "source": receipt_path,
+        "paths": sorted(frozen),
+        "stale_paths": sorted(stale_paths),
+    }, mechanical, []
 
 
 def live_closeout(
@@ -1400,19 +1838,32 @@ def live_closeout(
     valid_approvals = []
     valid_approval_paths = set()
     valid_human_approvals = []
-    valid_human_targets = set()
 
     changed_historical_paths = [
         changed
         for changed in event_paths
         if any(path_matches(changed, pattern) for pattern in historical_patterns)
     ]
+    required_types, approval_mapping_uncertainty = required_human_approval_types(
+        adapter,
+        event_paths,
+        historical_patterns,
+    )
+    human_required.extend(required_types)
+    targets_by_type = approval_targets_by_type(adapter, event_paths)
     dirty_changed_paths = sorted({
         path
         for entry in change_entries or []
         if (entry.get("metadata") or {}).get("dirty_at_baseline")
         for path in inventory_entry_paths(entry)
     })
+    freeze_summary, freeze_mechanical, freeze_unverified = evaluate_freeze_receipt(
+        getattr(args, "freeze_receipt", None) if args else None,
+        adapter=adapter,
+        workspace=workspace,
+        event_paths=event_paths,
+    )
+    mechanical.extend(freeze_mechanical)
     semantic_review, semantic_mechanical, bound_semantic_findings, semantic_unverified = evaluate_semantic_review(
         getattr(args, "semantic_review", None) if args else None,
         required=bool(getattr(args, "require_semantic_review", False)) if args else False,
@@ -1484,6 +1935,7 @@ def live_closeout(
     for approval in human_approvals:
         approval_type = approval["type"]
         evidence = approval["evidence"]
+        approval_targets = targets_by_type.get(approval_type, [])
         before = len(mechanical)
 
         if approval_type not in declared_human_types:
@@ -1535,41 +1987,54 @@ def live_closeout(
             else:
                 evidence_text = evidence_path.read_text(encoding="utf-8")
 
-        if changed_historical_paths:
+        if evidence_text and generated_non_authority_evidence(evidence_text):
+            mechanical.append({
+                "code": "generated-human-approval-evidence",
+                "type": approval_type,
+                "evidence": evidence,
+            })
+
+        if approval_targets:
             authorized_targets = [
                 path
-                for path in changed_historical_paths
+                for path in approval_targets
                 if any(path_matches(path, pattern) for pattern in authorized_docs)
             ]
         else:
             authorized_targets = []
-        if changed_historical_paths and sorted(authorized_targets) != sorted(changed_historical_paths):
+        if approval_targets and sorted(authorized_targets) != sorted(approval_targets):
             mechanical.append({
                 "code": "human-approval-target-not-authorized",
                 "type": approval_type,
-                "targets": sorted(set(changed_historical_paths) - set(authorized_targets)),
+                "targets": sorted(set(approval_targets) - set(authorized_targets)),
             })
 
-        if changed_historical_paths and evidence_text and not text_records_human_approval(
+        if evidence_text and not approval_targets:
+            mechanical.append({
+                "code": "human-approval-scope-unmapped",
+                "type": approval_type,
+                "evidence": evidence,
+            })
+        elif evidence_text and not text_records_human_approval(
             evidence_text,
             approval_type,
-            changed_historical_paths,
+            approval_targets,
         ):
             mechanical.append({
                 "code": "human-approval-scope-mismatch",
                 "type": approval_type,
                 "evidence": evidence,
-                "targets": changed_historical_paths,
+                "targets": approval_targets,
             })
 
         if len(mechanical) == before:
             accepted = {
                 "type": approval_type,
                 "evidence": evidence,
-                "targets": changed_historical_paths,
+                "targets": approval_targets,
             }
             valid_human_approvals.append(accepted)
-            valid_human_targets.update(changed_historical_paths)
+            human_required = [item for item in human_required if item != approval_type]
 
     for changed in event_paths:
         changed_protected = [pattern for pattern in protected_patterns if path_matches(changed, pattern)]
@@ -1603,8 +2068,6 @@ def live_closeout(
                     "path": changed,
                     "matched": changed_historical,
                 })
-            elif normalized not in valid_human_targets:
-                human_required.append(required_historical_approval_type(adapter))
             continue
         if changed_ordinary and not authorized:
             mechanical.append({
@@ -1616,15 +2079,16 @@ def live_closeout(
         if not authorized:
             mechanical.append({"code": "unauthorized-change", "path": changed})
 
+    empty_event = verification["verified"] and not event_paths
     if mechanical:
         result = "fail"
     elif human_required:
         result = "unproven"
-    elif not verification["verified"]:
+    elif not verification["verified"] or not verification["event_isolation_verified"]:
         result = "unproven"
     elif dirty_changed_paths:
         result = "unproven"
-    elif semantic_unverified:
+    elif semantic_unverified or freeze_unverified or approval_mapping_uncertainty or empty_event:
         result = "unproven"
     else:
         result = "pass"
@@ -1636,7 +2100,32 @@ def live_closeout(
         unverified.append("event-isolation")
     if dirty_changed_paths:
         unverified.append("dirty-baseline-attribution-unproven")
+    if empty_event:
+        unverified.append("empty-event-change-set")
     unverified.extend(semantic_unverified)
+    unverified.extend(freeze_unverified)
+    if approval_mapping_uncertainty:
+        unverified.append("human-approval-type-unmapped")
+
+    closeout_receipt = {
+        "schema": "govern-project-docs.closeout-receipt.v1",
+        "kind": "live-closeout",
+        "adapter": {
+            "project": adapter.get("project"),
+            "schema_version": adapter.get("schema_version"),
+        },
+        "workspace": {"path": str(workspace.resolve())},
+        "result": result,
+        "final_content": {
+            "freeze_receipt": freeze_summary.get("source"),
+            "verified": freeze_summary.get("verified", False),
+            "paths": freeze_summary.get("paths", []),
+            "stale_paths": freeze_summary.get("stale_paths", []),
+        },
+        "derived_evidence": True,
+        "generated": True,
+        "project_authority": False,
+    }
 
     return {
         "result": result,
@@ -1647,6 +2136,10 @@ def live_closeout(
             "event_isolation_verified": verification["event_isolation_verified"],
             "semantic_review_bound": semantic_review["status"] == "bound",
             "human_boundary_complete": not bool(human_required),
+            "final_content_frozen": freeze_summary["verified"],
+            "stale_frozen_paths": freeze_summary["stale_paths"],
+            "actor_identity_verified": False,
+            "actor_identity_reason": "filesystem and Git inventories do not identify which human or AI actor changed a path",
             "unverified": sorted(set(unverified)),
             "cannot_prove": [
                 "which AI or human actor modified a file",
@@ -1664,17 +2157,89 @@ def live_closeout(
             "authorized_docs": authorized_docs,
             "protected_approvals": valid_approvals,
             "verified_human_approvals": valid_human_approvals,
+            "approval_mapping_uncertainty": approval_mapping_uncertainty,
         },
         "mechanical_findings": mechanical,
         "semantic_review": semantic_review,
+        "freeze_receipt": freeze_summary,
+        "closeout_receipt": closeout_receipt,
         "semantic_findings": bound_semantic_findings,
         "human_approval_required": sorted(set(human_required)),
         "recovery": "Live Closeout checked adapter, receipt/baseline, change source, actual event paths, affected governed questions, unresolved semantic findings, unresolved human boundaries, and next inputs needed for recovery.",
     }
 
 
+def add_structured_closeout_recovery(payload: dict) -> dict:
+    mechanical_codes = [
+        finding.get("code", "mechanical-finding")
+        for finding in payload.get("mechanical_findings", [])
+    ]
+    unverified = list((payload.get("coverage") or {}).get("unverified", []))
+    missing = sorted(set(payload.get("human_approval_required", [])))
+    verified = sorted({
+        approval.get("type")
+        for approval in (payload.get("closeout") or {}).get("verified_human_approvals", [])
+        if approval.get("type")
+    })
+    required = sorted(set(missing + verified))
+
+    reasons: list[str] = []
+    reasons.extend(f"mechanical:{code}" for code in mechanical_codes)
+    reasons.extend(f"unverified:{item}" for item in unverified)
+    reasons.extend(f"human-approval-missing:{item}" for item in missing)
+    if not reasons:
+        reasons.append("all-closeout-gates-satisfied")
+
+    actions: list[str] = []
+    stale_paths = (payload.get("coverage") or {}).get("stale_frozen_paths", [])
+    if stale_paths:
+        actions.append(f"Refreeze final content for: {', '.join(stale_paths)}; rerun project validation and Closeout.")
+    if any(code.startswith("human-approval-") or code == "generated-human-approval-evidence" for code in mechanical_codes):
+        actions.append("Correct the exact human approval binding and its in-event ordinary evidence document.")
+    other_mechanical = [
+        code
+        for code in mechanical_codes
+        if code != "final-content-changed-after-freeze"
+        and not code.startswith("human-approval-")
+        and code != "generated-human-approval-evidence"
+    ]
+    if other_mechanical:
+        actions.append(f"Resolve mechanical findings: {', '.join(sorted(set(other_mechanical)))}.")
+    if "actual-change-set" in unverified or "event-isolation" in unverified:
+        actions.append("Run Impact before edits and pass its baseline receipt to Closeout with the exact event paths.")
+    if "final-content-freeze" in unverified:
+        actions.append("Freeze the final event paths, run project validation, then rerun Closeout with the freeze receipt.")
+    if any(item.startswith("semantic-") for item in unverified):
+        actions.append("Complete or resolve the semantic review and bind its authorized resolution evidence.")
+    if "human-approval-type-unmapped" in unverified:
+        actions.append("Map each affected authority rule to an exact adapter human_approval_types value.")
+    if missing:
+        actions.append(f"Obtain and bind exact human approval for: {', '.join(missing)}.")
+    if payload.get("result") == "pass":
+        actions.append("Preserve the derived receipt outside project authority and make no further governed edits; if content changes, refreeze, revalidate, and rerun Closeout.")
+    if not actions:
+        actions.append("Resolve the listed reasons and rerun Closeout.")
+
+    payload["result_reasons"] = reasons
+    payload["recovery_actions"] = actions
+    payload["approval_summary"] = {
+        "required": required,
+        "verified": verified,
+        "missing": missing,
+    }
+    return payload
+
+
 def closeout_command(args: argparse.Namespace) -> None:
-    live_requested = bool(args.changed_path or args.receipt or args.baseline_inventory or args.final_inventory or args.actual_path)
+    live_requested = bool(
+        args.changed_path
+        or args.receipt
+        or args.freeze_receipt
+        or args.baseline_inventory
+        or args.final_inventory
+        or args.actual_path
+        or args.write_receipt
+    )
     if live_requested:
         adapter, missing = load_json_or_missing(Path(args.adapter))
         if missing:
@@ -1692,7 +2257,7 @@ def closeout_command(args: argparse.Namespace) -> None:
                 "required": bool(args.require_semantic_review),
                 "findings": [],
             }
-            emit(missing)
+            emit(add_structured_closeout_recovery(missing))
             return
         payload = live_closeout(
             adapter,
@@ -1705,6 +2270,18 @@ def closeout_command(args: argparse.Namespace) -> None:
             args.human_approval,
             args,
         )
+        if args.write_receipt:
+            output_path, write_findings = write_receipt_file(
+                payload["closeout_receipt"],
+                args.write_receipt,
+                Path(args.workspace),
+                adapter,
+            )
+            payload["receipt_output"] = output_path
+            if write_findings:
+                payload["mechanical_findings"].extend(write_findings)
+                payload["result"] = "fail"
+                payload["closeout_receipt"]["result"] = "fail"
     else:
         if not args.cases:
             raise SystemExit("closeout requires either --changed-path for live mode or a cases file for fixture mode")
@@ -1715,7 +2292,7 @@ def closeout_command(args: argparse.Namespace) -> None:
             "cases": args.cases,
             "workspace": args.workspace,
         }
-    emit(payload)
+    emit(add_structured_closeout_recovery(payload))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1737,6 +2314,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     impact.set_defaults(func=impact_command)
 
+    freeze = sub.add_parser("freeze")
+    freeze.add_argument("adapter")
+    freeze.add_argument("--workspace", required=True)
+    freeze.add_argument("--changed-path", action="append", default=[])
+    freeze.add_argument("--write-receipt")
+    freeze.set_defaults(func=freeze_command)
+
     run = sub.add_parser("run-cases")
     run.add_argument("adapter")
     run.add_argument("cases")
@@ -1755,6 +2339,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
     )
     closeout.add_argument("--receipt")
+    closeout.add_argument("--freeze-receipt")
+    closeout.add_argument("--write-receipt")
     closeout.add_argument("--baseline-inventory")
     closeout.add_argument("--final-inventory")
     closeout.add_argument("--authorized-doc", action="append", default=[])

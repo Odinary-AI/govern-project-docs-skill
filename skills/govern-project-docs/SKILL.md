@@ -27,9 +27,30 @@ Read `references/adapter-schema.md` when creating or validating an adapter.
 Use `scripts/govern_project_docs.py` for deterministic adapter, fixture, and
 live diagnostic checks.
 
+## Essential Workflow
+
+Use one order for a governed development event:
+
+`Impact → authorized edits → semantic review → freeze → project validation → Closeout → no governed edits`
+
+Impact records the pre-change baseline. Freeze fingerprints the final event
+paths. Project-selected validation runs against those exact bytes. Closeout
+binds the baseline, final paths, semantic review, approvals, and freeze receipt.
+Any governed edit after freeze invalidates the proof: refreeze, revalidate, and
+rerun Closeout.
+
+Do not write promises such as “Closeout will run later” into persistent project
+facts. Run the gate in the task that is closing. Impact, freeze, and Closeout
+receipts are generated, non-authoritative evidence; keep them outside governed
+authority or in an adapter-excluded location, and do not commit them unless the
+project explicitly chooses to.
+
 ## Impact
 
 Run Impact before work starts or when the task meaning changes.
+
+For a live event, use `--workspace` and preserve the emitted receipt outside
+project authority. An empty Impact scope is `unproven`, not a successful no-op.
 
 Return:
 
@@ -52,12 +73,22 @@ Impact result:
 Run Closeout before declaring a task, batch, decision, validation change, or
 release-stage transition complete.
 
-For live Codex work, pass the declared changed paths and the documents
-authorized for the event. Closeout consumes a common Change Inventory, not raw
-Git semantics. Use `--receipt` from Impact when available. Git, filesystem
-snapshot, supplied inventory, and explicit declared paths are supported; explicit
-mode is always unverified. Fixture-only Closeout is for regression cases, not
-live task approval.
+For live Codex work, pass the declared changed paths, the documents authorized
+for the event, the Impact receipt, and a final-content freeze receipt. Closeout
+consumes a common Change Inventory, not raw Git semantics. Git is optional:
+filesystem snapshots provide the same event-isolation contract. Supplied or
+explicit path-only modes remain `unproven`. Fixture-only Closeout is for
+regression cases, not live task approval.
+
+Create the freeze after all governed edits and semantic dispositions, then run
+the project's own validation:
+
+```bash
+python3 scripts/govern_project_docs.py freeze adapter.json \
+  --workspace /path/to/project \
+  --changed-path STATUS.md \
+  --write-receipt /tmp/project-freeze.json
+```
 
 Protected paths fail by default. When a human has explicitly approved a
 protected configuration change, bind each approved path to a durable ordinary
@@ -69,9 +100,11 @@ or otherwise unauthorized paths.
 When a human has explicitly approved a governed semantic boundary such as
 historical material change, bind the approval type to an in-event ordinary
 evidence document with `--human-approval "TYPE=EVIDENCE"`. `TYPE` must be
-declared in the project adapter. The checker verifies the evidence path,
-event scope, authorization, and broad target/scope wording; it does not create
-or replace the human decision.
+declared in the project adapter and mapped by the affected authority rule's
+`human_approval_types`. The evidence must contain `Approval type:`, `Object:`,
+`Scope:`, and `Does not approve:`. One exact type never satisfies another; a
+protected-path approval never satisfies a semantic approval. The checker
+verifies the binding, not the truth or identity of the human decision.
 
 Return one result:
 
@@ -85,6 +118,8 @@ Missing, unresolved, or unhandled semantic findings keep Closeout `unproven`;
 malformed review input fails mechanically.
 
 Closeout must include recovery information for the next AI task.
+Use `result_reasons`, `recovery_actions`, and `approval_summary` for automation;
+the legacy `recovery` sentence remains for compatibility.
 
 ## Live Diagnostic
 
@@ -121,6 +156,10 @@ or out-of-event evidence fails mechanically; excluded paths remain blocked.
 Valid human approval bindings are reported separately as
 `verified_human_approvals`. They may satisfy a required human boundary, but
 they are not mechanical proof of the product or architecture decision itself.
+
+Live `pass` requires event isolation and an unchanged final-content freeze.
+No supported collector proves which human or AI actor changed a file; Closeout
+reports that limitation without downgrading an otherwise complete result.
 
 ## AI Semantic Review
 

@@ -53,6 +53,13 @@ Every run returns:
 - `coverage`;
 - `recovery`.
 
+Closeout also returns additive schema-1 fields:
+
+- `result_reasons`: ordered mechanical, unverified-capability, and missing-
+  approval reasons;
+- `recovery_actions`: ordered actions a fresh task can execute;
+- `approval_summary.required`, `.verified`, and `.missing`.
+
 `fail` is reserved for deterministic defects. Semantic uncertainty or missing
 human approval is `unproven`.
 
@@ -85,6 +92,37 @@ With `--workspace`, Impact emits a receipt:
 The receipt is derived evidence, not project authority. Pass it to Closeout with
 `--receipt` when you need filesystem or Git baseline isolation.
 
+Impact rejects an empty scope as `unproven`. Inventory inputs fail mechanically
+when schemas, source kinds, entry types, existence/digest fields, rename fields,
+or receipt identity do not match the contract. Impact receipts carry
+`derived_evidence: true`, `generated: true`, and `project_authority: false`.
+
+## Final-Content Freeze
+
+After the final governed edit and any semantic disposition, fingerprint every
+event path:
+
+```bash
+scripts/govern_project_docs.py freeze adapter.json \
+  --workspace /path/to/project \
+  --changed-path STATUS.md \
+  --write-receipt /tmp/project-freeze.json
+```
+
+The freeze receipt contains:
+
+- schema and `final-content-freeze` kind;
+- exact adapter and resolved-workspace identity;
+- a non-empty list of normalized event paths;
+- existence plus SHA-256 digest for each present file;
+- explicit non-existence for deleted files; and
+- generated, derived, non-authority markers.
+
+`--write-receipt` may write outside the workspace or under an adapter-excluded
+path. It fails before writing to a governed workspace path. Run project-selected
+validation after freeze. Any subsequent event-path edit makes Closeout fail with
+the stale paths; refreeze, revalidate, and rerun Closeout.
+
 ## Live Diagnostic
 
 `diagnose <adapter> --workspace <path>` checks:
@@ -105,6 +143,8 @@ Use live mode for real Codex tasks:
 ```bash
 scripts/govern_project_docs.py closeout adapter.json \
   --workspace /path/to/project \
+  --receipt /tmp/project-impact.json \
+  --freeze-receipt /tmp/project-freeze.json \
   --changed-path STATUS.md \
   --authorized-doc STATUS.md
 ```
@@ -154,7 +194,9 @@ require it.
 
 Supplied actual paths prove final path scope only. Supplied baseline plus final
 inventory, filesystem receipt, or another baseline-capable source is needed to
-verify event isolation. No mode proves which actor changed a file.
+verify event isolation. Live `pass` requires event isolation and an unchanged
+freeze receipt. Git and filesystem snapshots provide equivalent core evidence;
+Git is not required. No mode proves which actor changed a file.
 
 ### Approved Protected Changes
 
@@ -210,13 +252,25 @@ The binding is valid only when:
 - the evidence is an ordinary, non-protected, non-excluded, non-historical
   document;
 - the evidence is actually changed and event-authorized;
-- the target historical paths are actually changed and event-authorized; and
-- the evidence records human approval plus the approval type, object, and
-  scope in text.
+- every target path for that exact authority/approval type is actually changed
+  and event-authorized;
+- the affected authority rule maps the exact type through
+  `human_approval_types`; and
+- the evidence contains non-empty `Approval type:`, `Object:`, `Scope:`, and
+  `Does not approve:` fields, with the exact type and affected object.
 
 Valid bindings appear in `closeout.verified_human_approvals`. They can satisfy
-the Closeout gate for the declared human boundary, but they do not turn the
-human decision into a mechanical fact.
+only the exact mapped type. Architecture approval cannot satisfy release
+approval, technical acceptance cannot become release approval, and a protected
+approval never becomes semantic approval. A generated Impact, freeze, or
+Closeout receipt cannot be approval evidence. The checker verifies structure
+and event binding; it does not turn the human decision into a mechanical fact.
+
+Legacy `human: true` remains valid when the adapter declares exactly one
+top-level approval type. If several types are possible, or a historical path has
+no precise authority-rule mapping, Closeout is `unproven` with
+`human-approval-type-unmapped` until the existing optional mapping is made
+precise. Adapter schema remains `"1"`.
 
 ### Semantic Review Binding
 
@@ -251,6 +305,14 @@ Closeout behavior:
 
 Mechanical checks validate structure, paths, and disposition completeness only.
 They do not judge the truth of the semantic content.
+
+## Recovery Contract
+
+Use `result_reasons` to understand why the result is not `pass`, then execute
+`recovery_actions` in order. `approval_summary` distinguishes exact required,
+verified, and missing semantic types. The existing `recovery` string is retained
+for callers that have not adopted the structured fields. These additions do not
+change adapter schema 1 or existing command syntax.
 
 ## Semantic Finding Contract
 
