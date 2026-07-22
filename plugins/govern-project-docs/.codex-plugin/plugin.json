@@ -1,0 +1,35 @@
+{
+  "name": "govern-project-docs",
+  "version": "0.1.0",
+  "description": "Keep project documentation aligned with development facts and evidence.",
+  "author": {
+    "name": "Odinary-AI",
+    "url": "https://github.com/Odinary-AI"
+  },
+  "repository": "https://github.com/Odinary-AI/govern-project-docs-skill",
+  "license": "MIT",
+  "keywords": [
+    "agent-skills",
+    "documentation-governance",
+    "project-docs",
+    "codex",
+    "ai-agents"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Govern Project Docs",
+    "shortDescription": "Keep project docs aligned with development facts.",
+    "longDescription": "Run Impact and Closeout around development tasks so project documents stay aligned with facts, plans, decisions, evidence, release claims, and historical material.",
+    "developerName": "Odinary-AI",
+    "category": "Productivity",
+    "capabilities": [
+      "Documentation governance",
+      "Impact analysis",
+      "Closeout checks"
+    ],
+    "defaultPrompt": [
+      "Enable documentation governance. I am starting this task.",
+      "Enable documentation governance. Close out this task."
+    ]
+  }
+}

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Govern Project Docs"
+  short_description: "Keep project docs aligned with development facts."
+  default_prompt: "Run Impact or Closeout for a project documentation-governance event."

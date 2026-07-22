@@ -1,0 +1,20 @@
+{
+  "name": "govern-project-docs",
+  "interface": {
+    "displayName": "Govern Project Docs"
+  },
+  "plugins": [
+    {
+      "name": "govern-project-docs",
+      "source": {
+        "source": "local",
+        "path": "./plugins/govern-project-docs"
+      },
+      "category": "documentation",
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      }
+    }
+  ]
+}
