@@ -121,7 +121,30 @@ The freeze receipt contains:
 `--write-receipt` may write outside the workspace or under an adapter-excluded
 path. It fails before writing to a governed workspace path. Run project-selected
 validation after freeze. Any subsequent event-path edit makes Closeout fail with
-the stale paths; refreeze, revalidate, and rerun Closeout.
+the stale paths; refreeze, rerun project-selected affected validation, and
+rerun Closeout.
+
+## Validation Evidence Reuse
+
+Evidence freshness depends on its relevant inputs, command, configuration,
+environment or toolchain, and supported claim. After a governed post-Freeze
+edit, create a new Freeze, rerun the project-selected affected validation, and
+rerun Closeout; the checker does not select project tests, and no adapter field
+is added.
+
+| Change or result | Validation action |
+| --- | --- |
+| Ordinary governance document not consumed by runtime regression | Rerun affected document, link, or architecture checks only. |
+| Tested current-fact or executable document | Rerun every consuming obligation. |
+| Runtime, API, persistence, routing, architecture, or evaluation input | Rerun the corresponding complete validation from the project contract. |
+| Status label, gate name, or Closeout retry only | Reuse unaffected evidence. |
+| `unproven` caused by isolation, approval, or human boundary | Follow the recovery action; do not rerun unrelated tests. |
+
+Deduplicate only when command, inputs, configuration, environment or toolchain,
+and claim scope are materially identical. Route recovery as follows: missing
+evidence → produce relevant evidence; broad claim → narrow the claim; missing
+isolation → restore baseline-capable evidence; missing approval mapping or human
+decision → request that decision.
 
 ## Live Diagnostic
 

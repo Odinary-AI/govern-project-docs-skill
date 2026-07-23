@@ -36,14 +36,37 @@ Use one order for a governed development event:
 Impact records the pre-change baseline. Freeze fingerprints the final event
 paths. Project-selected validation runs against those exact bytes. Closeout
 binds the baseline, final paths, semantic review, approvals, and freeze receipt.
-Any governed edit after freeze invalidates the proof: refreeze, revalidate, and
-rerun Closeout.
+Any governed edit after freeze invalidates the proof: refreeze, rerun
+project-selected affected validation, and rerun Closeout.
 
 Do not write promises such as “Closeout will run later” into persistent project
 facts. Run the gate in the task that is closing. Impact, freeze, and Closeout
 receipts are generated, non-authoritative evidence; keep them outside governed
 authority or in an adapter-excluded location, and do not commit them unless the
 project explicitly chooses to.
+
+## Validation Reuse And Invalidation
+
+After any governed edit made after Freeze, create a new Freeze, run the
+project-selected validation affected by that edit, and rerun Closeout. This does
+not default to rerunning all tests.
+
+Reuse validation evidence while its relevant inputs, command, configuration,
+environment, and supported claim are unchanged. A status update, gate rename,
+or Closeout retry does not by itself invalidate unrelated evidence.
+
+- Ordinary governance-document edits normally invalidate only the structural,
+  link, documentation, or architecture checks that consume them. If the
+  project validation contract treats a document as a tested current-fact or
+  executable input, rerun every obligation that consumes it.
+- Runtime, public API, persistence, routing, architecture-contract, evaluation,
+  or other full-regression input changes invalidate the corresponding complete
+  validation required by the project contract.
+- For `unproven`, follow `recovery_actions`; do not repeat unrelated tests to
+  compensate for missing event isolation, approval mapping, or a human decision.
+- When several validation layers require the same obligation, execute the
+  deduplicated union only when command, inputs, configuration, environment, and
+  claim scope are materially identical.
 
 ## Impact
 
